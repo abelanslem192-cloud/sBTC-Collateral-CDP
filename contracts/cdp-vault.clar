@@ -3,6 +3,7 @@
 
 (use-trait sip010-token .sip-010-trait.sip-010-trait)
 (use-trait stable-token-trait .sip-010-trait.sip-010-trait)
+(use-trait flash-loan-trait .flash-loan-trait.flash-loan-trait)
 
 ;; Constants
 (define-constant contract-owner tx-sender)
@@ -19,6 +20,7 @@
 (define-constant liquidation-ratio u150) ;; 150% collateralization ratio
 (define-constant liquidation-penalty u10) ;; 10% penalty
 (define-constant oracle-decimals u8)
+(define-constant flash-mint-fee u10) ;; 0.1% fee (basis points)
 
 ;; Data Vars
 (define-data-var sbtc-price uint u50000000000) ;; $50,000 * 10^6 (mock price with 6 decimals for simplicity matching stablecoin)
@@ -205,5 +207,30 @@
 
             (ok actual-reward)
         )
+    )
+)
+
+;; 6. Flash Mint
+(define-public (flash-mint
+        (amount uint)
+        (flash-loan-contract <flash-loan-trait>)
+    )
+    (let (
+            ;; Calculate fee (0.1%)
+            (fee (/ (* amount flash-mint-fee) u10000))
+            (total-repay (+ amount fee))
+        )
+        ;; Mint stablecoin to caller (optimistic minting)
+        (try! (contract-call? .stable-token mint-for-vault amount tx-sender))
+
+        ;; Execute callback on borrower contract
+        ;; Borrower must use funds and approve contract to burn total-repay amount
+        (try! (contract-call? flash-loan-contract execute amount))
+
+        ;; Burn principal + fee from borrower
+        ;; If borrower doesn't have enough, this fails and reverts entire tx
+        (try! (contract-call? .stable-token burn-for-vault total-repay tx-sender))
+
+        (ok total-repay)
     )
 )
