@@ -24,6 +24,12 @@ epoch = 'latest'
 path = 'contracts/stable-token.clar'
 clarity_version = 3
 epoch = 'latest'
+
+[contracts.flash-loan-trait]
+path = 'contracts/flash-loan-trait.clar'
+clarity_version = 3
+epoch = 'latest'
+
 [repl.analysis]
 passes = ['check_checker']
 

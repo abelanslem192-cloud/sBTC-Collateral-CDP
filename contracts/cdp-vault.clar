@@ -3,6 +3,7 @@
 
 (use-trait sip010-token .sip-010-trait.sip-010-trait)
 (use-trait stable-token-trait .sip-010-trait.sip-010-trait)
+(use-trait flash-loan-trait .flash-loan-trait.flash-loan-trait)
 
 ;; Constants
 (define-constant contract-owner tx-sender)
@@ -19,6 +20,9 @@
 (define-constant liquidation-ratio u150) ;; 150% collateralization ratio
 (define-constant liquidation-penalty u10) ;; 10% penalty
 (define-constant oracle-decimals u8)
+(define-constant flash-mint-fee u10) ;; 0.1% fee (basis points)
+(define-constant interest-rate-per-block u150) ;; ~7.5% APR
+(define-constant scale-factor u100000000)
 
 ;; Data Vars
 (define-data-var sbtc-price uint u50000000000) ;; $50,000 * 10^6 (mock price with 6 decimals for simplicity matching stablecoin)
@@ -29,7 +33,20 @@
     {
         collateral: uint,
         debt: uint,
+        last-accrued-block: uint
     }
+)
+
+;; Helper: Calculate Interest
+(define-private (calculate-accrued-interest (debt uint) (last-accrued-block uint))
+    (if (or (is-eq debt u0) (is-eq last-accrued-block u0))
+        u0
+        (let (
+            (delta-blocks (- burn-block-height last-accrued-block))
+            (interest (/ (* debt interest-rate-per-block delta-blocks) scale-factor))
+        )
+        interest)
+    )
 )
 
 ;; Read-Only Functions
@@ -38,6 +55,7 @@
     (default-to {
         collateral: u0,
         debt: u0,
+        last-accrued-block: burn-block-height
     }
         (map-get? vaults user)
     )
@@ -56,11 +74,12 @@
     (let (
             (vault (get-vault user))
             (collateral-val (calculate-collateral-value (get collateral vault)))
-            (debt (get debt vault))
+            (pending-interest (calculate-accrued-interest (get debt vault) (get last-accrued-block vault)))
+            (total-debt (+ (get debt vault) pending-interest))
         )
-        (if (is-eq debt u0)
+        (if (is-eq total-debt u0)
             u99999999 ;; Infinite ratio if no debt
-            (/ (* collateral-val u100) debt) ;; Ratio in percentage
+            (/ (* collateral-val u100) total-debt) ;; Ratio in percentage
         )
     )
 )
@@ -82,13 +101,16 @@
             (vault (get-vault tx-sender))
             (current-collateral (get collateral vault))
             (new-collateral (+ current-collateral amount))
+            (pending-interest (calculate-accrued-interest (get debt vault) (get last-accrued-block vault)))
+            (new-debt (+ (get debt vault) pending-interest))
         )
         (try! (contract-call? .sbtc-token transfer amount tx-sender
             (as-contract tx-sender) none
         ))
         (map-set vaults tx-sender {
             collateral: new-collateral,
-            debt: (get debt vault),
+            debt: new-debt,
+            last-accrued-block: burn-block-height
         })
         (ok new-collateral)
     )
@@ -98,7 +120,8 @@
 (define-public (borrow (amount uint))
     (let (
             (vault (get-vault tx-sender))
-            (current-debt (get debt vault))
+            (pending-interest (calculate-accrued-interest (get debt vault) (get last-accrued-block vault)))
+            (current-debt (+ (get debt vault) pending-interest))
             (new-debt (+ current-debt amount))
             (collateral-val (calculate-collateral-value (get collateral vault)))
         )
@@ -114,6 +137,7 @@
         (map-set vaults tx-sender {
             collateral: (get collateral vault),
             debt: new-debt,
+            last-accrued-block: burn-block-height
         })
         (ok new-debt)
     )
@@ -123,7 +147,8 @@
 (define-public (repay (amount uint))
     (let (
             (vault (get-vault tx-sender))
-            (current-debt (get debt vault))
+            (pending-interest (calculate-accrued-interest (get debt vault) (get last-accrued-block vault)))
+            (current-debt (+ (get debt vault) pending-interest))
         )
         (asserts! (<= amount current-debt) err-repayment-too-high)
 
@@ -133,6 +158,7 @@
         (map-set vaults tx-sender {
             collateral: (get collateral vault),
             debt: (- current-debt amount),
+            last-accrued-block: burn-block-height
         })
         (ok (- current-debt amount))
     )
@@ -144,14 +170,15 @@
             (vault (get-vault tx-sender))
             (current-collateral (get collateral vault))
             (new-collateral (- current-collateral amount))
-            (debt (get debt vault))
+            (pending-interest (calculate-accrued-interest (get debt vault) (get last-accrued-block vault)))
+            (current-debt (+ (get debt vault) pending-interest))
             (collateral-val (calculate-collateral-value new-collateral))
         )
         (asserts! (>= current-collateral amount) err-insufficient-collateral)
 
         ;; Check if withdrawal keeps ratio above 150% (if debt exists)
         (asserts!
-            (or (is-eq debt u0) (>= (/ (* collateral-val u100) debt) liquidation-ratio))
+            (or (is-eq current-debt u0) (>= (/ (* collateral-val u100) current-debt) liquidation-ratio))
             err-under-collateralized
         )
 
@@ -159,7 +186,8 @@
 
         (map-set vaults tx-sender {
             collateral: new-collateral,
-            debt: debt,
+            debt: current-debt,
+            last-accrued-block: burn-block-height
         })
         (ok new-collateral)
     )
@@ -170,8 +198,10 @@
     (let (
             (vault (get-vault target))
             (collateral (get collateral vault))
-            (debt (get debt vault))
-            (ratio (calculate-current-ratio target))
+            (pending-interest (calculate-accrued-interest (get debt vault) (get last-accrued-block vault)))
+            (debt (+ (get debt vault) pending-interest))
+            (collateral-val (calculate-collateral-value collateral))
+            (ratio (if (is-eq debt u0) u99999999 (/ (* collateral-val u100) debt)))
         )
         ;; Check if ratio is below 150%
         (asserts! (< ratio liquidation-ratio) err-liquidation-not-allowed)
@@ -205,5 +235,30 @@
 
             (ok actual-reward)
         )
+    )
+)
+
+;; 6. Flash Mint
+(define-public (flash-mint
+        (amount uint)
+        (flash-loan-contract <flash-loan-trait>)
+    )
+    (let (
+            ;; Calculate fee (0.1%)
+            (fee (/ (* amount flash-mint-fee) u10000))
+            (total-repay (+ amount fee))
+        )
+        ;; Mint stablecoin to caller (optimistic minting)
+        (try! (contract-call? .stable-token mint-for-vault amount tx-sender))
+
+        ;; Execute callback on borrower contract
+        ;; Borrower must use funds and approve contract to burn total-repay amount
+        (try! (contract-call? flash-loan-contract execute amount))
+
+        ;; Burn principal + fee from borrower
+        ;; If borrower doesn't have enough, this fails and reverts entire tx
+        (try! (contract-call? .stable-token burn-for-vault total-repay tx-sender))
+
+        (ok total-repay)
     )
 )
