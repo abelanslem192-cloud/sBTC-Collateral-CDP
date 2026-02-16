@@ -15,6 +15,8 @@
 (define-constant err-repayment-too-high (err u105))
 (define-constant err-liquidation-not-allowed (err u106))
 (define-constant err-transfer-failed (err u107))
+(define-constant err-merge-self (err u108))
+(define-constant err-empty-source (err u109))
 
 ;; Math Constants
 (define-constant liquidation-ratio u150) ;; 150% collateralization ratio
@@ -32,6 +34,13 @@
         collateral: uint,
         debt: uint,
     }
+)
+
+;; Feature 10: Merge Approvals
+;; Source owner approves a destination to absorb their vault
+(define-map merge-approvals
+    { source: principal, destination: principal }
+    bool
 )
 
 ;; Read-Only Functions
@@ -65,6 +74,11 @@
             (/ (* collateral-val u100) debt) ;; Ratio in percentage
         )
     )
+)
+
+;; Feature 10: Check if merge is approved
+(define-read-only (is-merge-approved (source principal) (destination principal))
+    (default-to false (map-get? merge-approvals { source: source, destination: destination }))
 )
 
 ;; Public Functions
@@ -110,7 +124,6 @@
         )
 
         ;; Mint stablecoin to user
-        ;; Note: cdp-vault must be authorized minter in stable-token
         (try! (contract-call? .stable-token mint-for-vault amount tx-sender))
 
         (map-set vaults tx-sender {
@@ -178,14 +191,6 @@
         ;; Check if ratio is below 150%
         (asserts! (< ratio liquidation-ratio) err-liquidation-not-allowed)
 
-        ;; Liquidator pays off debt by burning stablecoin
-        ;; Liquidator receives collateral minus penalty? 
-        ;; Simplified: Liquidator pays debt, gets equivalent collateral + 10% bonus
-        ;; But wait, if they pay all debt, they might get more collateral than debt value.
-        ;; Let's assume liquidator pays `debt` amount of stablecoin.
-        ;; Liquidator MUST receive collateral worth `debt * 1.10`.
-        ;; If vault doesn't have enough collateral, they get everything (bad debt protocol loss, but we ignore for MVP).
-
         (let (
                 (debt-value-in-collateral (/ (* debt u100000000) (var-get sbtc-price))) ;; Convert debt back to sBTC satoshis
                 (reward-collateral (/ (* debt-value-in-collateral (+ u100 liquidation-penalty)) u100))
@@ -224,13 +229,76 @@
         (try! (contract-call? .stable-token mint-for-vault amount tx-sender))
 
         ;; Execute callback on borrower contract
-        ;; Borrower must use funds and approve contract to burn total-repay amount
         (try! (contract-call? flash-loan-contract execute amount))
 
         ;; Burn principal + fee from borrower
-        ;; If borrower doesn't have enough, this fails and reverts entire tx
         (try! (contract-call? .stable-token burn-for-vault total-repay tx-sender))
 
         (ok total-repay)
+    )
+)
+
+;; ============================================
+;; Feature 10: Vault Merging
+;; ============================================
+;; Allows one user to absorb another user's vault (collateral + debt).
+;; Requires explicit approval from the source vault owner.
+;; The merged vault must remain above the liquidation ratio.
+
+;; Source owner grants permission for destination to absorb their vault
+(define-public (approve-merge (destination principal))
+    (begin
+        (asserts! (not (is-eq tx-sender destination)) err-merge-self)
+        (ok (map-set merge-approvals { source: tx-sender, destination: destination } true))
+    )
+)
+
+;; Source owner revokes merge permission
+(define-public (revoke-merge (destination principal))
+    (ok (map-delete merge-approvals { source: tx-sender, destination: destination }))
+)
+
+;; Destination calls this to absorb the source vault
+;; tx-sender = destination (the one absorbing)
+(define-public (merge-vault (source principal))
+    (let (
+            (source-vault (get-vault source))
+            (dest-vault (get-vault tx-sender))
+            (source-collateral (get collateral source-vault))
+            (source-debt (get debt source-vault))
+            (dest-collateral (get collateral dest-vault))
+            (dest-debt (get debt dest-vault))
+            (merged-collateral (+ dest-collateral source-collateral))
+            (merged-debt (+ dest-debt source-debt))
+            (merged-collateral-val (calculate-collateral-value merged-collateral))
+        )
+        ;; Cannot merge with self
+        (asserts! (not (is-eq tx-sender source)) err-merge-self)
+
+        ;; Source must have approved this merge
+        (asserts! (is-merge-approved source tx-sender) err-owner-only)
+
+        ;; Source vault must have something to merge
+        (asserts! (or (> source-collateral u0) (> source-debt u0)) err-empty-source)
+
+        ;; Merged vault must remain above liquidation ratio (if it has debt)
+        (asserts!
+            (or (is-eq merged-debt u0) (>= (/ (* merged-collateral-val u100) merged-debt) liquidation-ratio))
+            err-under-collateralized
+        )
+
+        ;; Update destination vault with combined values
+        (map-set vaults tx-sender {
+            collateral: merged-collateral,
+            debt: merged-debt,
+        })
+
+        ;; Delete source vault
+        (map-delete vaults source)
+
+        ;; Clean up approval
+        (map-delete merge-approvals { source: source, destination: tx-sender })
+
+        (ok { collateral: merged-collateral, debt: merged-debt })
     )
 )
