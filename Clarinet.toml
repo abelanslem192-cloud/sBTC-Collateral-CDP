@@ -1,44 +1,50 @@
 [project]
-name = 'sBTC-Collateral-CDP'
-description = ''
+name = "sBTC-Collateral-CDP"
+description = ""
 authors = []
 telemetry = true
-cache_dir = '.\.cache'
-requirements = []
-[contracts.cdp-vault]
-path = 'contracts/cdp-vault.clar'
-clarity_version = 3
-epoch = 'latest'
-
-[contracts.sbtc-token]
-path = 'contracts/sbtc-token.clar'
-clarity_version = 3
-epoch = 'latest'
+cache_dir = "./.cache"
 
 [contracts.sip-010-trait]
-path = 'contracts/sip-010-trait.clar'
-clarity_version = 3
-epoch = 'latest'
-
-[contracts.stable-token]
-path = 'contracts/stable-token.clar'
-clarity_version = 3
-epoch = 'latest'
+path = "contracts/sip-010-trait.clar"
+clarity_version = 2
+epoch = 2.5
 
 [contracts.flash-loan-trait]
-path = 'contracts/flash-loan-trait.clar'
-clarity_version = 3
-epoch = 'latest'
+path = "contracts/flash-loan-trait.clar"
+clarity_version = 2
+epoch = 2.5
+
+[contracts.oracle-trait]
+path = "contracts/oracle-trait.clar"
+clarity_version = 2
+epoch = 2.5
+
+[contracts.sbtc-token]
+path = "contracts/sbtc-token.clar"
+clarity_version = 2
+epoch = 2.5
+
+[contracts.stable-token]
+path = "contracts/stable-token.clar"
+clarity_version = 2
+epoch = 2.5
+
+[contracts.oracle-registry]
+path = "contracts/oracle-registry.clar"
+clarity_version = 2
+epoch = 2.5
+
+[contracts.cdp-vault]
+path = "contracts/cdp-vault.clar"
+clarity_version = 2
+epoch = 2.5
 
 [repl.analysis]
-passes = ['check_checker']
+passes = ["check_checker"]
 
 [repl.analysis.check_checker]
 strict = false
 trusted_sender = false
 trusted_caller = false
 callee_filter = false
-
-[repl.remote_data]
-enabled = false
-api_url = 'https://api.hiro.so'
