@@ -30,6 +30,16 @@ path = 'contracts/flash-loan-trait.clar'
 clarity_version = 3
 epoch = 'latest'
 
+[contracts.oracle-trait]
+path = 'contracts/oracle-trait.clar'
+clarity_version = 3
+epoch = 'latest'
+
+[contracts.oracle-registry]
+path = 'contracts/oracle-registry.clar'
+clarity_version = 3
+epoch = 'latest'
+
 [repl.analysis]
 passes = ['check_checker']
 
