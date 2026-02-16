@@ -15,6 +15,7 @@
 (define-constant err-repayment-too-high (err u105))
 (define-constant err-liquidation-not-allowed (err u106))
 (define-constant err-transfer-failed (err u107))
+(define-constant err-shutdown (err u108))
 
 ;; Math Constants
 (define-constant liquidation-ratio u150) ;; 150% collateralization ratio
@@ -24,6 +25,7 @@
 
 ;; Data Vars
 (define-data-var sbtc-price uint u50000000000) ;; $50,000 * 10^6 (mock price with 6 decimals for simplicity matching stablecoin)
+(define-data-var shutdown-activated bool false) ;; Circuit Breaker
 
 ;; Maps
 (define-map vaults
@@ -78,8 +80,23 @@
     )
 )
 
+;; Admin: Toggle Circuit Breaker
+(define-public (toggle-shutdown (shutdown bool))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (var-set shutdown-activated shutdown)
+        (ok shutdown)
+    )
+)
+
+(define-read-only (is-shutdown)
+    (var-get shutdown-activated)
+)
+
 ;; 1. Deposit Collateral
 (define-public (deposit-collateral (amount uint))
+    (begin
+        (asserts! (not (var-get shutdown-activated)) err-shutdown)
     (let (
             (vault (get-vault tx-sender))
             (current-collateral (get collateral vault))
@@ -93,11 +110,13 @@
             debt: (get debt vault),
         })
         (ok new-collateral)
-    )
+    ))
 )
 
 ;; 2. Borrow (Mint Stablecoin)
 (define-public (borrow (amount uint))
+    (begin
+        (asserts! (not (var-get shutdown-activated)) err-shutdown)
     (let (
             (vault (get-vault tx-sender))
             (current-debt (get debt vault))
@@ -118,7 +137,7 @@
             debt: new-debt,
         })
         (ok new-debt)
-    )
+    ))
 )
 
 ;; 3. Repay (Burn Stablecoin)
@@ -215,6 +234,8 @@
         (amount uint)
         (flash-loan-contract <flash-loan-trait>)
     )
+    (begin
+        (asserts! (not (var-get shutdown-activated)) err-shutdown)
     (let (
             ;; Calculate fee (0.1%)
             (fee (/ (* amount flash-mint-fee) u10000))
@@ -232,5 +253,5 @@
         (try! (contract-call? .stable-token burn-for-vault total-repay tx-sender))
 
         (ok total-repay)
-    )
+    ))
 )
