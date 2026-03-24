@@ -5,7 +5,6 @@
 (use-trait stable-token-trait .sip-010-trait.sip-010-trait)
 (use-trait flash-loan-trait .flash-loan-trait.flash-loan-trait)
 
-;; Constants
 (define-constant contract-owner tx-sender)
 (define-constant err-owner-only (err u100))
 (define-constant err-insufficient-collateral (err u101))
@@ -15,17 +14,27 @@
 (define-constant err-repayment-too-high (err u105))
 (define-constant err-liquidation-not-allowed (err u106))
 (define-constant err-transfer-failed (err u107))
+(define-constant err-paused (err u110))
+(define-constant err-not-guardian (err u111))
+(define-constant err-no-debt-required (err u112))
+(define-constant err-emergency-withdraw-disabled (err u113))
 
-;; Math Constants
-(define-constant liquidation-ratio u150) ;; 150% collateralization ratio
-(define-constant liquidation-penalty u10) ;; 10% penalty
+(define-constant liquidation-ratio u150)
+(define-constant liquidation-penalty u10)
 (define-constant oracle-decimals u8)
-(define-constant flash-mint-fee u10) ;; 0.1% fee (basis points)
+(define-constant flash-mint-fee u10)
 
-;; Data Vars
-(define-data-var sbtc-price uint u50000000000) ;; $50,000 * 10^6 (mock price with 6 decimals for simplicity matching stablecoin)
+(define-data-var sbtc-price uint u50000000000)
+(define-data-var pause-deposits bool false)
+(define-data-var pause-borrows bool false)
+(define-data-var pause-repayments bool false)
+(define-data-var pause-withdrawals bool false)
+(define-data-var pause-liquidations bool false)
+(define-data-var pause-flash-mints bool false)
+(define-data-var global-pause bool false)
+(define-data-var emergency-withdraw-enabled bool false)
+(define-data-var pause-guardian (optional principal) none)
 
-;; Maps
 (define-map vaults
     principal
     {
@@ -33,8 +42,6 @@
         debt: uint,
     }
 )
-
-;; Read-Only Functions
 
 (define-read-only (get-vault (user principal))
     (default-to {
@@ -50,7 +57,6 @@
 )
 
 (define-read-only (calculate-collateral-value (collateral-amount uint))
-    ;; collateral (8 decimals) * price (6 decimals) / 10^8 = value in 6 decimals (stablecoin match)
     (/ (* collateral-amount (var-get sbtc-price)) u100000000)
 )
 
@@ -61,15 +67,181 @@
             (debt (get debt vault))
         )
         (if (is-eq debt u0)
-            u99999999 ;; Infinite ratio if no debt
-            (/ (* collateral-val u100) debt) ;; Ratio in percentage
+            u99999999
+            (/ (* collateral-val u100) debt)
         )
     )
 )
 
-;; Public Functions
+(define-read-only (is-deposit-paused)
+    (or (var-get global-pause) (var-get pause-deposits))
+)
 
-;; Admin: Set Price
+(define-read-only (is-borrow-paused)
+    (or (var-get global-pause) (var-get pause-borrows))
+)
+
+(define-read-only (is-repayment-paused)
+    (or (var-get global-pause) (var-get pause-repayments))
+)
+
+(define-read-only (is-withdrawal-paused)
+    (or (var-get global-pause) (var-get pause-withdrawals))
+)
+
+(define-read-only (is-liquidation-paused)
+    (or (var-get global-pause) (var-get pause-liquidations))
+)
+
+(define-read-only (is-flash-mint-paused)
+    (or (var-get global-pause) (var-get pause-flash-mints))
+)
+
+(define-read-only (get-pause-status)
+    {
+        global: (var-get global-pause),
+        deposits: (is-deposit-paused),
+        borrows: (is-borrow-paused),
+        repayments: (is-repayment-paused),
+        withdrawals: (is-withdrawal-paused),
+        liquidations: (is-liquidation-paused),
+        flash-mints: (is-flash-mint-paused),
+        emergency-withdraw: (var-get emergency-withdraw-enabled),
+        guardian: (var-get pause-guardian),
+    }
+)
+
+(define-read-only (get-pause-guardian)
+    (var-get pause-guardian)
+)
+
+(define-read-only (is-guardian (caller principal))
+    (match (var-get pause-guardian)
+        guardian (is-eq caller guardian)
+        false
+    )
+)
+
+(define-private (is-owner-or-guardian (caller principal))
+    (or (is-eq caller contract-owner) (is-guardian caller))
+)
+
+(define-public (set-pause-guardian (new-guardian (optional principal)))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (var-set pause-guardian new-guardian)
+        (print {
+            event: "pause-guardian-updated",
+            guardian: new-guardian,
+            caller: tx-sender,
+        })
+        (ok true)
+    )
+)
+
+(define-public (set-global-pause (paused bool))
+    (begin
+        (asserts! (is-owner-or-guardian tx-sender) err-not-guardian)
+        (if paused
+            (begin
+                (var-set global-pause true)
+                (print {
+                    event: "global-pause-activated",
+                    caller: tx-sender,
+                })
+            )
+            (begin
+                (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+                (var-set global-pause false)
+                (print {
+                    event: "global-pause-deactivated",
+                    caller: tx-sender,
+                })
+            )
+        )
+        (ok true)
+    )
+)
+
+(define-public (set-operation-pause
+        (deposits bool)
+        (borrows bool)
+        (repayments bool)
+        (withdrawals bool)
+        (liquidations bool)
+        (flash-mints bool)
+    )
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (var-set pause-deposits deposits)
+        (var-set pause-borrows borrows)
+        (var-set pause-repayments repayments)
+        (var-set pause-withdrawals withdrawals)
+        (var-set pause-liquidations liquidations)
+        (var-set pause-flash-mints flash-mints)
+        (print {
+            event: "operation-pause-updated",
+            deposits: deposits,
+            borrows: borrows,
+            repayments: repayments,
+            withdrawals: withdrawals,
+            liquidations: liquidations,
+            flash-mints: flash-mints,
+            caller: tx-sender,
+        })
+        (ok true)
+    )
+)
+
+(define-public (guardian-pause-deposits)
+    (begin
+        (asserts! (is-owner-or-guardian tx-sender) err-not-guardian)
+        (var-set pause-deposits true)
+        (print { event: "guardian-paused-deposits", caller: tx-sender })
+        (ok true)
+    )
+)
+
+(define-public (guardian-pause-borrows)
+    (begin
+        (asserts! (is-owner-or-guardian tx-sender) err-not-guardian)
+        (var-set pause-borrows true)
+        (print { event: "guardian-paused-borrows", caller: tx-sender })
+        (ok true)
+    )
+)
+
+(define-public (guardian-pause-liquidations)
+    (begin
+        (asserts! (is-owner-or-guardian tx-sender) err-not-guardian)
+        (var-set pause-liquidations true)
+        (print { event: "guardian-paused-liquidations", caller: tx-sender })
+        (ok true)
+    )
+)
+
+(define-public (guardian-pause-flash-mints)
+    (begin
+        (asserts! (is-owner-or-guardian tx-sender) err-not-guardian)
+        (var-set pause-flash-mints true)
+        (print { event: "guardian-paused-flash-mints", caller: tx-sender })
+        (ok true)
+    )
+)
+
+(define-public (set-emergency-withdraw (enabled bool))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (var-set emergency-withdraw-enabled enabled)
+        (print {
+            event: "emergency-withdraw-toggled",
+            enabled: enabled,
+            caller: tx-sender,
+        })
+        (ok true)
+    )
+)
+
 (define-public (set-price (new-price uint))
     (begin
         (asserts! (is-eq tx-sender contract-owner) err-owner-only)
@@ -78,13 +250,13 @@
     )
 )
 
-;; 1. Deposit Collateral
 (define-public (deposit-collateral (amount uint))
     (let (
             (vault (get-vault tx-sender))
             (current-collateral (get collateral vault))
             (new-collateral (+ current-collateral amount))
         )
+        (asserts! (not (is-deposit-paused)) err-paused)
         (try! (contract-call? .sbtc-token transfer amount tx-sender
             (as-contract tx-sender) none
         ))
@@ -96,7 +268,6 @@
     )
 )
 
-;; 2. Borrow (Mint Stablecoin)
 (define-public (borrow (amount uint))
     (let (
             (vault (get-vault tx-sender))
@@ -104,15 +275,11 @@
             (new-debt (+ current-debt amount))
             (collateral-val (calculate-collateral-value (get collateral vault)))
         )
-        ;; Check if new debt keeps ratio above 150%
+        (asserts! (not (is-borrow-paused)) err-paused)
         (asserts! (>= (/ (* collateral-val u100) new-debt) liquidation-ratio)
             err-under-collateralized
         )
-
-        ;; Mint stablecoin to user
-        ;; Note: cdp-vault must be authorized minter in stable-token
         (try! (contract-call? .stable-token mint-for-vault amount tx-sender))
-
         (map-set vaults tx-sender {
             collateral: (get collateral vault),
             debt: new-debt,
@@ -121,17 +288,14 @@
     )
 )
 
-;; 3. Repay (Burn Stablecoin)
 (define-public (repay (amount uint))
     (let (
             (vault (get-vault tx-sender))
             (current-debt (get debt vault))
         )
+        (asserts! (not (is-repayment-paused)) err-paused)
         (asserts! (<= amount current-debt) err-repayment-too-high)
-
-        ;; Burn stablecoin from user
         (try! (contract-call? .stable-token burn-for-vault amount tx-sender))
-
         (map-set vaults tx-sender {
             collateral: (get collateral vault),
             debt: (- current-debt amount),
@@ -140,7 +304,6 @@
     )
 )
 
-;; 4. Withdraw Collateral
 (define-public (withdraw-collateral (amount uint))
     (let (
             (vault (get-vault tx-sender))
@@ -149,16 +312,13 @@
             (debt (get debt vault))
             (collateral-val (calculate-collateral-value new-collateral))
         )
+        (asserts! (not (is-withdrawal-paused)) err-paused)
         (asserts! (>= current-collateral amount) err-insufficient-collateral)
-
-        ;; Check if withdrawal keeps ratio above 150% (if debt exists)
         (asserts!
             (or (is-eq debt u0) (>= (/ (* collateral-val u100) debt) liquidation-ratio))
             err-under-collateralized
         )
-
         (try! (as-contract (contract-call? .sbtc-token transfer amount tx-sender tx-sender none)))
-
         (map-set vaults tx-sender {
             collateral: new-collateral,
             debt: debt,
@@ -167,7 +327,31 @@
     )
 )
 
-;; 5. Liquidate (Simplified: Instant full liquidation)
+(define-public (emergency-withdraw (amount uint))
+    (let (
+            (vault (get-vault tx-sender))
+            (current-collateral (get collateral vault))
+            (debt (get debt vault))
+            (new-collateral (- current-collateral amount))
+        )
+        (asserts! (var-get emergency-withdraw-enabled) err-emergency-withdraw-disabled)
+        (asserts! (is-eq debt u0) err-no-debt-required)
+        (asserts! (>= current-collateral amount) err-insufficient-collateral)
+        (try! (as-contract (contract-call? .sbtc-token transfer amount tx-sender tx-sender none)))
+        (map-set vaults tx-sender {
+            collateral: new-collateral,
+            debt: u0,
+        })
+        (print {
+            event: "emergency-withdrawal",
+            user: tx-sender,
+            amount: amount,
+            remaining: new-collateral,
+        })
+        (ok new-collateral)
+    )
+)
+
 (define-public (liquidate (target principal))
     (let (
             (vault (get-vault target))
@@ -175,62 +359,38 @@
             (debt (get debt vault))
             (ratio (calculate-current-ratio target))
         )
-        ;; Check if ratio is below 150%
+        (asserts! (not (is-liquidation-paused)) err-paused)
         (asserts! (< ratio liquidation-ratio) err-liquidation-not-allowed)
-
-        ;; Liquidator pays off debt by burning stablecoin
-        ;; Liquidator receives collateral minus penalty? 
-        ;; Simplified: Liquidator pays debt, gets equivalent collateral + 10% bonus
-        ;; But wait, if they pay all debt, they might get more collateral than debt value.
-        ;; Let's assume liquidator pays `debt` amount of stablecoin.
-        ;; Liquidator MUST receive collateral worth `debt * 1.10`.
-        ;; If vault doesn't have enough collateral, they get everything (bad debt protocol loss, but we ignore for MVP).
-
         (let (
-                (debt-value-in-collateral (/ (* debt u100000000) (var-get sbtc-price))) ;; Convert debt back to sBTC satoshis
+                (debt-value-in-collateral (/ (* debt u100000000) (var-get sbtc-price)))
                 (reward-collateral (/ (* debt-value-in-collateral (+ u100 liquidation-penalty)) u100))
                 (actual-reward (if (> reward-collateral collateral)
                     collateral
                     reward-collateral
                 ))
             )
-            ;; Burn debt from liquidator
             (try! (contract-call? .stable-token burn-for-vault debt tx-sender))
-
-            ;; Send collateral to liquidator
             (try! (as-contract (contract-call? .sbtc-token transfer actual-reward tx-sender
                 tx-sender none
             )))
-
-            ;; Clear vault
             (map-delete vaults target)
-
             (ok actual-reward)
         )
     )
 )
 
-;; 6. Flash Mint
 (define-public (flash-mint
         (amount uint)
         (flash-loan-contract <flash-loan-trait>)
     )
     (let (
-            ;; Calculate fee (0.1%)
             (fee (/ (* amount flash-mint-fee) u10000))
             (total-repay (+ amount fee))
         )
-        ;; Mint stablecoin to caller (optimistic minting)
+        (asserts! (not (is-flash-mint-paused)) err-paused)
         (try! (contract-call? .stable-token mint-for-vault amount tx-sender))
-
-        ;; Execute callback on borrower contract
-        ;; Borrower must use funds and approve contract to burn total-repay amount
         (try! (contract-call? flash-loan-contract execute amount))
-
-        ;; Burn principal + fee from borrower
-        ;; If borrower doesn't have enough, this fails and reverts entire tx
         (try! (contract-call? .stable-token burn-for-vault total-repay tx-sender))
-
         (ok total-repay)
     )
 )
