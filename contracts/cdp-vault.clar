@@ -17,15 +17,22 @@
 (define-constant err-transfer-failed (err u107))
 (define-constant err-merge-self (err u108))
 (define-constant err-empty-source (err u109))
+(define-constant err-paused (err u110))
+(define-constant err-debt-ceiling-reached (err u111))
 
 ;; Math Constants
-(define-constant liquidation-ratio u150) ;; 150% collateralization ratio
-(define-constant liquidation-penalty u10) ;; 10% penalty
+(define-constant liquidation-ratio u150)
+(define-constant liquidation-penalty-liquidator u8)
+(define-constant liquidation-penalty-protocol u2)
 (define-constant oracle-decimals u8)
-(define-constant flash-mint-fee u10) ;; 0.1% fee (basis points)
+(define-constant flash-mint-fee u10)
 
 ;; Data Vars
-(define-data-var sbtc-price uint u50000000000) ;; $50,000 * 10^6 (mock price with 6 decimals for simplicity matching stablecoin)
+(define-data-var sbtc-price uint u50000000000)
+(define-data-var is-paused bool false)
+(define-data-var total-debt uint u0)
+(define-data-var debt-ceiling uint u1000000000000)
+(define-data-var protocol-treasury principal contract-owner)
 
 ;; Maps
 (define-map vaults
@@ -36,15 +43,12 @@
     }
 )
 
-;; Feature 10: Merge Approvals
-;; Source owner approves a destination to absorb their vault
 (define-map merge-approvals
     { source: principal, destination: principal }
     bool
 )
 
 ;; Read-Only Functions
-
 (define-read-only (get-vault (user principal))
     (default-to {
         collateral: u0,
@@ -58,8 +62,11 @@
     (var-get sbtc-price)
 )
 
+(define-read-only (get-total-debt)
+    (var-get total-debt)
+)
+
 (define-read-only (calculate-collateral-value (collateral-amount uint))
-    ;; collateral (8 decimals) * price (6 decimals) / 10^8 = value in 6 decimals (stablecoin match)
     (/ (* collateral-amount (var-get sbtc-price)) u100000000)
 )
 
@@ -70,20 +77,39 @@
             (debt (get debt vault))
         )
         (if (is-eq debt u0)
-            u99999999 ;; Infinite ratio if no debt
-            (/ (* collateral-val u100) debt) ;; Ratio in percentage
+            u99999999
+            (/ (* collateral-val u100) debt)
         )
     )
 )
 
-;; Feature 10: Check if merge is approved
 (define-read-only (is-merge-approved (source principal) (destination principal))
     (default-to false (map-get? merge-approvals { source: source, destination: destination }))
 )
 
 ;; Public Functions
 
-;; Admin: Set Price
+(define-public (set-paused (paused bool))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (ok (var-set is-paused paused))
+    )
+)
+
+(define-public (set-debt-ceiling (ceiling uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (ok (var-set debt-ceiling ceiling))
+    )
+)
+
+(define-public (set-protocol-treasury (treasury principal))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (ok (var-set protocol-treasury treasury))
+    )
+)
+
 (define-public (set-price (new-price uint))
     (begin
         (asserts! (is-eq tx-sender contract-owner) err-owner-only)
@@ -92,13 +118,13 @@
     )
 )
 
-;; 1. Deposit Collateral
 (define-public (deposit-collateral (amount uint))
     (let (
             (vault (get-vault tx-sender))
             (current-collateral (get collateral vault))
             (new-collateral (+ current-collateral amount))
         )
+        (asserts! (not (var-get is-paused)) err-paused)
         (try! (contract-call? .sbtc-token transfer amount tx-sender
             (as-contract tx-sender) none
         ))
@@ -110,7 +136,6 @@
     )
 )
 
-;; 2. Borrow (Mint Stablecoin)
 (define-public (borrow (amount uint))
     (let (
             (vault (get-vault tx-sender))
@@ -118,42 +143,40 @@
             (new-debt (+ current-debt amount))
             (collateral-val (calculate-collateral-value (get collateral vault)))
         )
-        ;; Check if new debt keeps ratio above 150%
-        (asserts! (>= (/ (* collateral-val u100) new-debt) liquidation-ratio)
-            err-under-collateralized
-        )
+        (asserts! (not (var-get is-paused)) err-paused)
+        (asserts! (<= (+ (var-get total-debt) amount) (var-get debt-ceiling)) err-debt-ceiling-reached)
+        (asserts! (>= (/ (* collateral-val u100) new-debt) liquidation-ratio) err-under-collateralized)
 
-        ;; Mint stablecoin to user
         (try! (contract-call? .stable-token mint-for-vault amount tx-sender))
 
         (map-set vaults tx-sender {
             collateral: (get collateral vault),
             debt: new-debt,
         })
+        (var-set total-debt (+ (var-get total-debt) amount))
         (ok new-debt)
     )
 )
 
-;; 3. Repay (Burn Stablecoin)
 (define-public (repay (amount uint))
     (let (
             (vault (get-vault tx-sender))
             (current-debt (get debt vault))
         )
+        (asserts! (not (var-get is-paused)) err-paused)
         (asserts! (<= amount current-debt) err-repayment-too-high)
 
-        ;; Burn stablecoin from user
         (try! (contract-call? .stable-token burn-for-vault amount tx-sender))
 
         (map-set vaults tx-sender {
             collateral: (get collateral vault),
             debt: (- current-debt amount),
         })
+        (var-set total-debt (- (var-get total-debt) amount))
         (ok (- current-debt amount))
     )
 )
 
-;; 4. Withdraw Collateral
 (define-public (withdraw-collateral (amount uint))
     (let (
             (vault (get-vault tx-sender))
@@ -162,9 +185,9 @@
             (debt (get debt vault))
             (collateral-val (calculate-collateral-value new-collateral))
         )
+        (asserts! (not (var-get is-paused)) err-paused)
         (asserts! (>= current-collateral amount) err-insufficient-collateral)
 
-        ;; Check if withdrawal keeps ratio above 150% (if debt exists)
         (asserts!
             (or (is-eq debt u0) (>= (/ (* collateral-val u100) debt) liquidation-ratio))
             err-under-collateralized
@@ -180,7 +203,6 @@
     )
 )
 
-;; 5. Liquidate (Simplified: Instant full liquidation)
 (define-public (liquidate (target principal))
     (let (
             (vault (get-vault target))
@@ -188,78 +210,73 @@
             (debt (get debt vault))
             (ratio (calculate-current-ratio target))
         )
-        ;; Check if ratio is below 150%
+        (asserts! (not (var-get is-paused)) err-paused)
         (asserts! (< ratio liquidation-ratio) err-liquidation-not-allowed)
 
         (let (
-                (debt-value-in-collateral (/ (* debt u100000000) (var-get sbtc-price))) ;; Convert debt back to sBTC satoshis
-                (reward-collateral (/ (* debt-value-in-collateral (+ u100 liquidation-penalty)) u100))
-                (actual-reward (if (> reward-collateral collateral)
-                    collateral
-                    reward-collateral
-                ))
+                (debt-value-in-collateral (/ (* debt u100000000) (var-get sbtc-price)))
+                (penalty-total (+ liquidation-penalty-liquidator liquidation-penalty-protocol))
+                (reward-collateral (/ (* debt-value-in-collateral (+ u100 penalty-total)) u100))
+                (actual-reward (if (> reward-collateral collateral) collateral reward-collateral))
+                
+                (liquidator-base (/ (* debt-value-in-collateral (+ u100 liquidation-penalty-liquidator)) u100))
+                (liquidator-reward (if (> liquidator-base actual-reward) actual-reward liquidator-base))
+                (protocol-reward (- actual-reward liquidator-reward))
             )
-            ;; Burn debt from liquidator
             (try! (contract-call? .stable-token burn-for-vault debt tx-sender))
 
-            ;; Send collateral to liquidator
-            (try! (as-contract (contract-call? .sbtc-token transfer actual-reward tx-sender
-                tx-sender none
-            )))
+            (try! (as-contract (contract-call? .sbtc-token transfer liquidator-reward tx-sender tx-sender none)))
+            
+            (if (> protocol-reward u0)
+                (try! (as-contract (contract-call? .sbtc-token transfer protocol-reward tx-sender (var-get protocol-treasury) none)))
+                false
+            )
 
-            ;; Clear vault
             (map-delete vaults target)
+            (var-set total-debt (- (var-get total-debt) debt))
 
             (ok actual-reward)
         )
     )
 )
 
-;; 6. Flash Mint
 (define-public (flash-mint
         (amount uint)
         (flash-loan-contract <flash-loan-trait>)
     )
     (let (
-            ;; Calculate fee (0.1%)
             (fee (/ (* amount flash-mint-fee) u10000))
             (total-repay (+ amount fee))
         )
-        ;; Mint stablecoin to caller (optimistic minting)
+        (asserts! (not (var-get is-paused)) err-paused)
+        (asserts! (<= (+ (var-get total-debt) amount) (var-get debt-ceiling)) err-debt-ceiling-reached)
+        
+        (var-set total-debt (+ (var-get total-debt) amount))
+        
         (try! (contract-call? .stable-token mint-for-vault amount tx-sender))
-
-        ;; Execute callback on borrower contract
         (try! (contract-call? flash-loan-contract execute amount))
-
-        ;; Burn principal + fee from borrower
         (try! (contract-call? .stable-token burn-for-vault total-repay tx-sender))
-
+        
+        (var-set total-debt (- (var-get total-debt) amount))
         (ok total-repay)
     )
 )
 
-;; ============================================
-;; Feature 10: Vault Merging
-;; ============================================
-;; Allows one user to absorb another user's vault (collateral + debt).
-;; Requires explicit approval from the source vault owner.
-;; The merged vault must remain above the liquidation ratio.
-
-;; Source owner grants permission for destination to absorb their vault
 (define-public (approve-merge (destination principal))
     (begin
+        (asserts! (not (var-get is-paused)) err-paused)
         (asserts! (not (is-eq tx-sender destination)) err-merge-self)
         (ok (map-set merge-approvals { source: tx-sender, destination: destination } true))
     )
 )
 
-;; Source owner revokes merge permission
 (define-public (revoke-merge (destination principal))
-    (ok (map-delete merge-approvals { source: tx-sender, destination: destination }))
+    (begin
+        (asserts! (not (var-get is-paused)) err-paused)
+        (ok (map-delete merge-approvals { source: tx-sender, destination: destination }))
+    )
 )
 
-;; Destination calls this to absorb the source vault
-;; tx-sender = destination (the one absorbing)
 (define-public (merge-vault (source principal))
     (let (
             (source-vault (get-vault source))
@@ -272,31 +289,21 @@
             (merged-debt (+ dest-debt source-debt))
             (merged-collateral-val (calculate-collateral-value merged-collateral))
         )
-        ;; Cannot merge with self
+        (asserts! (not (var-get is-paused)) err-paused)
         (asserts! (not (is-eq tx-sender source)) err-merge-self)
-
-        ;; Source must have approved this merge
         (asserts! (is-merge-approved source tx-sender) err-owner-only)
-
-        ;; Source vault must have something to merge
         (asserts! (or (> source-collateral u0) (> source-debt u0)) err-empty-source)
 
-        ;; Merged vault must remain above liquidation ratio (if it has debt)
         (asserts!
             (or (is-eq merged-debt u0) (>= (/ (* merged-collateral-val u100) merged-debt) liquidation-ratio))
             err-under-collateralized
         )
 
-        ;; Update destination vault with combined values
         (map-set vaults tx-sender {
             collateral: merged-collateral,
             debt: merged-debt,
         })
-
-        ;; Delete source vault
         (map-delete vaults source)
-
-        ;; Clean up approval
         (map-delete merge-approvals { source: source, destination: tx-sender })
 
         (ok { collateral: merged-collateral, debt: merged-debt })
